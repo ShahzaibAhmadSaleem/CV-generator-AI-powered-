@@ -1,8 +1,9 @@
+
 """
 AI CV Generator
 ===============
-A Streamlit app that interviews the user with Grok (xAI) and turns the answers
-into a clean, ATS-friendly, professionally formatted PDF CV.
+A Streamlit app that interviews the user with an LLM (Groq or xAI Grok) and turns
+the answers into a clean, ATS-friendly, professionally formatted PDF CV.
 
 Flow:  upload photo (optional)  ->  start conversation  ->  answer questions
        ->  click "Generate CV"  ->  download PDF
@@ -42,10 +43,39 @@ from reportlab.platypus import (
 # Configuration
 # --------------------------------------------------------------------------- #
 
-XAI_BASE_URL = "https://api.x.ai/v1"
-# Model names change over time. Override with the XAI_MODEL secret / env var or
-# via the sidebar. See https://docs.x.ai for the current list.
-DEFAULT_MODEL = "grok-4-1-fast-non-reasoning"
+# Both providers expose an OpenAI-compatible API, so the one `openai` SDK serves both.
+# NOTE: "Groq" (groq.com, keys start with gsk_) and "Grok" (xAI, keys start with
+# xai-) are two different companies with different endpoints and API keys.
+# Model names change over time, so the app loads the list of models your key can
+# use straight from the provider; "default_model" is only the fallback.
+PROVIDERS: dict[str, dict[str, str]] = {
+    "Groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "llama-3.3-70b-versatile",
+        "key_env": "GROQ_API_KEY",
+        "model_env": "GROQ_MODEL",
+        "key_prefix": "gsk_",
+        "model_prefix": "",
+        "console": "console.groq.com/keys",
+        "models_doc": "console.groq.com/docs/models",
+    },
+    "xAI (Grok)": {
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-4.3",
+        "key_env": "XAI_API_KEY",
+        "model_env": "XAI_MODEL",
+        "key_prefix": "xai-",
+        "model_prefix": "grok",
+        "console": "console.x.ai",
+        "models_doc": "docs.x.ai",
+    },
+}
+DEFAULT_PROVIDER = "Groq"
+# Skip models that cannot do text chat (speech, images, embeddings, safety classifiers...).
+NON_CHAT_HINTS = (
+    "image", "imagine", "video", "embed", "tts", "stt", "voice", "aurora",
+    "whisper", "guard", "orpheus", "playai", "transcri", "moderation", "safeguard",
+)
 
 INTERVIEW_DONE_MARKER = "[[INTERVIEW_COMPLETE]]"
 
@@ -136,52 +166,92 @@ Rules:
 
 
 # --------------------------------------------------------------------------- #
-# Grok (xAI) helpers
+# LLM helpers (Groq / xAI)
 # --------------------------------------------------------------------------- #
 
-def get_client(api_key: str) -> OpenAI:
-    """xAI's API is OpenAI-compatible, so we use the OpenAI SDK with a new base URL."""
-    return OpenAI(api_key=api_key, base_url=XAI_BASE_URL, timeout=120.0)
+def get_client(api_key: str, base_url: str) -> OpenAI:
+    """Groq and xAI are OpenAI-compatible, so we use the OpenAI SDK with a custom base URL."""
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=120.0)
 
 
-def call_grok(
+def call_llm(
     client: OpenAI,
     model: str,
     messages: list[dict[str, str]],
     json_mode: bool = False,
     temperature: float = 0.4,
 ) -> str:
-    """Send a chat completion request and return the text of the reply."""
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-    }
+    """
+    Send a chat completion request and return the text of the reply.
+    If the API rejects an optional parameter (JSON mode, temperature) with a 400,
+    retry without it. Key / model problems are raised straight away.
+    """
+    kwargs: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
-    try:
-        response = client.chat.completions.create(**kwargs)
-    except BadRequestError:
-        if not json_mode:
-            raise
-        # Some models reject response_format; retry and rely on the prompt + parser.
-        kwargs.pop("response_format", None)
-        response = client.chat.completions.create(**kwargs)
-    return (response.choices[0].message.content or "").strip()
+    droppable = [k for k in ("response_format", "temperature") if k in kwargs]
+    while True:
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return (response.choices[0].message.content or "").strip()
+        except BadRequestError as exc:
+            low = (api_message(exc) + " " + str(exc)).lower()
+            fatal = any(t in low for t in ("api key", "not found", "does not exist", "no access", "decommissioned"))
+            if fatal or not droppable:
+                raise
+            kwargs.pop(droppable.pop(0), None)
 
 
-def friendly_error(exc: Exception) -> str:
+def api_message(exc: Exception) -> str:
+    """Pull the human-readable message out of an API error (its JSON shape varies by provider)."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            err = err.get("message")
+        for candidate in (err, body.get("message"), body.get("code")):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    text = getattr(getattr(exc, "response", None), "text", "")
+    if isinstance(text, str) and text.strip():
+        return text.strip()[:300]
+    return str(exc)
+
+
+def friendly_error(exc: Exception, provider: str = "The AI provider") -> str:
     """Turn API exceptions into messages a normal user can act on."""
     name = type(exc).__name__
-    if name == "AuthenticationError":
-        return "Your xAI API key was rejected. Please check that it is correct and active."
+    detail = api_message(exc)
+    low = (detail + " " + str(exc)).lower()
+    cfg = PROVIDERS.get(provider, {})
+    where = cfg.get("console", "your provider's console")
+    if name == "AuthenticationError" or "api key" in low:
+        return (
+            f"{provider} rejected your API key. Re-copy it from {where} (no quotes or spaces) and make "
+            f"sure the selected provider matches the key. {provider} said: {detail}"
+        )
     if name == "RateLimitError":
-        return "xAI rate limit or credit limit reached. Please wait a moment or check your xAI credits."
-    if name == "NotFoundError":
-        return "The selected model was not found. Change the model name in the sidebar (see docs.x.ai)."
+        return f"{provider} rate limit or quota reached. Wait a minute and retry, or check your usage limits. {provider} said: {detail}"
+    if name == "PermissionDeniedError":
+        return f"Your key does not have permission for this request (or the account has no credits). {provider} said: {detail}"
+    model_gone = any(t in low for t in ("not found", "does not exist", "deprecated", "decommissioned", "invalid"))
+    if name == "NotFoundError" or ("model" in low and model_gone):
+        return f"That model is not available for your key. Pick another model in the sidebar. {provider} said: {detail}"
     if name in {"APIConnectionError", "APITimeoutError"}:
-        return "Could not reach the xAI API. Please check your connection and try again."
-    return f"Something went wrong: {exc}"
+        return f"Could not reach {provider}. Please check your connection and try again."
+    status = getattr(exc, "status_code", None)
+    return f"{provider} API error{f' ({status})' if status else ''}: {detail}"
+
+
+def list_chat_models(api_key: str, base_url: str, model_prefix: str = "") -> list[str]:
+    """Ask the provider which chat models this key can use (raises on failure)."""
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=20.0)
+    ids = [m.id for m in client.models.list()]
+    chat = [
+        i for i in ids
+        if i.lower().startswith(model_prefix) and not any(h in i.lower() for h in NON_CHAT_HINTS)
+    ]
+    return sorted(set(chat), reverse=True)
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -214,7 +284,7 @@ def build_transcript(messages: list[dict[str, Any]]) -> str:
 
 
 def extract_cv_data(client: OpenAI, model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
-    reply = call_grok(
+    reply = call_llm(
         client,
         model,
         [
@@ -678,34 +748,78 @@ def init_state() -> None:
         st.session_state.setdefault(key, value)
 
 
-def render_sidebar() -> tuple[str, str, str, str]:
+def render_sidebar() -> tuple[str, str, str, str, str]:
+    """Returns (api_key, provider, model, accent_name, page_name)."""
+    names = list(PROVIDERS)
     with st.sidebar:
         st.header("Settings")
-        secret_key = get_setting("XAI_API_KEY")
+        wanted = get_setting("LLM_PROVIDER", DEFAULT_PROVIDER)
+        provider = st.selectbox(
+            "AI provider",
+            names,
+            index=names.index(wanted) if wanted in names else 0,
+            help="Groq (groq.com) and xAI Grok (x.ai) are different services with different API keys.",
+        )
+        cfg = PROVIDERS[provider]
+
+        secret_key = get_setting(cfg["key_env"])
         if secret_key:
-            st.success("xAI API key loaded from secrets.")
+            st.success(f"{cfg['key_env']} loaded from secrets.")
             api_key = secret_key
         else:
             api_key = st.text_input(
-                "xAI (Grok) API key",
+                f"{provider} API key",
                 type="password",
-                help="Create one at console.x.ai. It is only kept in memory for this session.",
-            ).strip()
-        model = st.text_input(
-            "Grok model",
-            value=get_setting("XAI_MODEL", DEFAULT_MODEL),
-            help="Any chat model available to your xAI account. See docs.x.ai for current names.",
-        ).strip() or DEFAULT_MODEL
+                help=f"Create one at {cfg['console']}. It is only kept in memory for this session.",
+            )
+        api_key = api_key.strip().strip("\"'").strip()
+
+        # Auto-correct the provider when the key clearly belongs to the other one.
+        for name, other in PROVIDERS.items():
+            if name != provider and api_key.startswith(other["key_prefix"]):
+                st.info(f"That looks like a {name} key, so the app is using {name}.")
+                provider, cfg = name, other
+                break
+        if api_key and not api_key.startswith(cfg["key_prefix"]):
+            st.warning(f"{provider} keys normally start with '{cfg['key_prefix']}'. Double-check what you pasted.")
+
+        # Discover the models this key can actually use (cached per provider+key for the session).
+        configured = get_setting(cfg["model_env"], cfg["default_model"])
+        models: list[str] = []
+        if api_key:
+            cache = st.session_state.setdefault("models_cache", {})
+            cache_key = f"{provider}|{api_key}"
+            if cache_key not in cache:
+                try:
+                    cache[cache_key] = (list_chat_models(api_key, cfg["base_url"], cfg["model_prefix"]), "")
+                except Exception as exc:
+                    cache[cache_key] = ([], friendly_error(exc, provider))
+            models, list_error = cache[cache_key]
+            if list_error:
+                st.error(list_error)
+        if models:
+            index = models.index(configured) if configured in models else 0
+            model = st.selectbox(
+                "Model", models, index=index, key=f"model_sel_{provider}",
+                help=f"Models available to your {provider} key.",
+            )
+        else:
+            model = st.text_input(
+                "Model",
+                value=configured,
+                key=f"model_txt_{provider}",
+                help=f"Could not load the model list; type a model name from {cfg['models_doc']}.",
+            ).strip() or cfg["default_model"]
         st.divider()
         st.subheader("CV style")
         accent_name = st.selectbox("Accent colour", list(ACCENT_COLORS), index=0)
         page_name = st.selectbox("Page size", list(PAGE_SIZES), index=0)
         st.divider()
         st.caption(
-            "Your answers are sent to the xAI API to write your CV. "
+            f"Your answers are sent to {provider} to write your CV. "
             "Nothing is stored by this app after you close the tab."
         )
-    return api_key, model, accent_name, page_name
+    return api_key, provider, model, accent_name, page_name
 
 
 def ask_agent(client: OpenAI, model: str) -> None:
@@ -713,7 +827,7 @@ def ask_agent(client: OpenAI, model: str) -> None:
     api_messages = [{"role": "system", "content": INTERVIEW_SYSTEM_PROMPT}] + [
         {"role": m["role"], "content": m["content"]} for m in st.session_state.messages
     ]
-    reply = call_grok(client, model, api_messages, temperature=0.5)
+    reply = call_llm(client, model, api_messages, temperature=0.5)
     if INTERVIEW_DONE_MARKER in reply:
         reply = reply.replace(INTERVIEW_DONE_MARKER, "").strip()
         st.session_state.interview_done = True
@@ -723,7 +837,8 @@ def ask_agent(client: OpenAI, model: str) -> None:
 def main() -> None:
     st.set_page_config(page_title="AI CV Generator", page_icon="📄", layout="centered")
     init_state()
-    api_key, model, accent_name, page_name = render_sidebar()
+    api_key, provider, model, accent_name, page_name = render_sidebar()
+    base_url = PROVIDERS[provider]["base_url"]
 
     st.title("📄 AI CV Generator")
     st.caption("Chat with an AI interviewer, then download a professional, job-ready PDF CV.")
@@ -748,7 +863,7 @@ def main() -> None:
     started = st.session_state.started
     if st.button("🔄 Restart conversation" if started else "🚀 Start conversation", key="start_btn"):
         if not api_key:
-            st.warning("Please enter your xAI API key in the sidebar first.")
+            st.warning(f"Please enter your {provider} API key in the sidebar first.")
         else:
             st.session_state.messages = [
                 {"role": "user", "content": "Hi! I'd like to create a professional CV.", "hidden": True}
@@ -756,10 +871,10 @@ def main() -> None:
             st.session_state.update(started=True, interview_done=False, cv_data=None, pdf_bytes=None)
             try:
                 with st.spinner("Starting the interview..."):
-                    ask_agent(get_client(api_key), model)
+                    ask_agent(get_client(api_key, base_url), model)
             except Exception as exc:
                 st.session_state.update(started=False, messages=[])
-                st.error(friendly_error(exc))
+                st.error(friendly_error(exc, provider))
 
     if st.session_state.started:
         user_input = st.chat_input("Type your answer here...")
@@ -768,11 +883,11 @@ def main() -> None:
             st.session_state.pdf_bytes = None  # CV is now out of date
             try:
                 with st.spinner("Thinking..."):
-                    ask_agent(get_client(api_key), model)
+                    ask_agent(get_client(api_key, base_url), model)
             except Exception as exc:
-                st.error(friendly_error(exc))
+                st.error(friendly_error(exc, provider))
         elif user_input:
-            st.warning("Please enter your xAI API key in the sidebar.")
+            st.warning(f"Please enter your {provider} API key in the sidebar.")
 
         for m in st.session_state.messages:
             if m.get("hidden"):
@@ -797,7 +912,7 @@ def main() -> None:
     if st.button("✨ Generate CV", disabled=not ready, type="primary", key="gen_btn"):
         try:
             with st.spinner("Writing and formatting your CV..."):
-                cv = extract_cv_data(get_client(api_key), model, st.session_state.messages)
+                cv = extract_cv_data(get_client(api_key, base_url), model, st.session_state.messages)
                 if not cv["full_name"]:
                     raise ValueError("I could not find your name yet. Please provide it in the chat and try again.")
                 st.session_state.cv_data = cv
@@ -807,7 +922,7 @@ def main() -> None:
         except ValueError as exc:
             st.error(str(exc))
         except Exception as exc:
-            st.error(friendly_error(exc))
+            st.error(friendly_error(exc, provider))
 
     if st.session_state.pdf_bytes:
         cv = st.session_state.cv_data
