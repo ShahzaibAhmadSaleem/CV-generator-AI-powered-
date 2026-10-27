@@ -3,10 +3,11 @@
 AI CV Generator
 ===============
 A Streamlit app that interviews the user with an LLM (Groq or xAI Grok) and turns
-the answers into a clean, ATS-friendly, professionally formatted PDF CV.
+the answers into a clean, ATS-friendly, professionally formatted CV that can be
+downloaded as a PDF or as an editable Word (.docx) file.
 
 Flow:  upload photo (optional)  ->  start conversation  ->  answer questions
-       ->  click "Generate CV"  ->  download PDF
+       ->  click "Generate CV"  ->  download PDF / Word
 
 Run locally:   streamlit run app.py
 """
@@ -23,6 +24,13 @@ from xml.sax.saxutils import escape
 
 import streamlit as st
 from openai import BadRequestError, OpenAI
+from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt, RGBColor
 from PIL import Image, ImageOps
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_RIGHT
@@ -284,6 +292,7 @@ def build_transcript(messages: list[dict[str, Any]]) -> str:
 
 
 def extract_cv_data(client: OpenAI, model: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Ask the model for CV data. Returns the raw parsed JSON; call normalize_cv() on it."""
     reply = call_llm(
         client,
         model,
@@ -294,29 +303,41 @@ def extract_cv_data(client: OpenAI, model: str, messages: list[dict[str, Any]]) 
         json_mode=True,
         temperature=0.2,
     )
-    return normalize_cv(parse_json_object(reply))
+    return parse_json_object(reply)
 
 
 # --------------------------------------------------------------------------- #
 # Data cleaning / normalisation
 # --------------------------------------------------------------------------- #
 
-def clean(value: Any) -> str:
+def clean(value: Any, latin_only: bool = True) -> str:
     """
-    Make text safe for ReportLab's built-in Helvetica font (WinAnsi / Latin-1 range).
-    Accented Latin letters, curly quotes, dashes and bullets are kept; characters the
-    font cannot draw are transliterated if possible, otherwise dropped (so you never
-    get black boxes in the PDF).
+    Normalise text for output.
+
+    latin_only=True (PDF): make it safe for ReportLab's built-in Helvetica font
+    (WinAnsi / Latin-1 range). Accented Latin letters, curly quotes, dashes and bullets
+    are kept; characters the font cannot draw are transliterated if possible, otherwise
+    dropped (so you never get black boxes in the PDF).
+
+    latin_only=False (Word): keep every script (Urdu, Arabic, Chinese, ...) and only
+    strip characters that are invalid in a .docx file.
     """
     if value is None:
         return ""
     text = unicodedata.normalize("NFC", str(value))
-    text = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", text)
+    if latin_only:
+        text = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", text)
+    else:  # keep ZWNJ/ZWJ and direction marks: they matter in Urdu/Persian/Arabic
+        text = re.sub(r"[\u200b\u2060\ufeff]", "", text)
     text = text.replace("\u00a0", " ").replace("\u2011", "-").replace("\u2212", "-")
     out: list[str] = []
     for ch in text:
         if ch in "\r\n\t" or ord(ch) < 32:
             out.append(" ")
+            continue
+        if not latin_only:
+            if unicodedata.category(ch) not in ("Cs", "Co", "Cn") and ch not in "\ufffe\uffff":
+                out.append(ch)
             continue
         try:
             ch.encode("cp1252")
@@ -342,16 +363,22 @@ def as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
 
-def as_bullets(value: Any) -> list[str]:
+def as_bullets(value: Any, latin_only: bool = True) -> list[str]:
     if isinstance(value, str):
         value = [re.sub(r"^\s*[-*\u2022]\s*", "", line) for line in value.splitlines()]
-    return [b for b in (clean(x) for x in as_list(value)) if b]
+    return [b for b in (clean(x, latin_only) for x in as_list(value)) if b]
 
 
-def normalize_cv(raw: dict[str, Any]) -> dict[str, Any]:
+def normalize_cv(raw: dict[str, Any], latin_only: bool = True) -> dict[str, Any]:
     """Coerce whatever the model returned into a predictable structure."""
+    def cl(v: Any) -> str:
+        return clean(v, latin_only)
+
+    def bul(v: Any) -> list[str]:
+        return as_bullets(v, latin_only)
+
     cv: dict[str, Any] = {
-        key: clean(raw.get(key))
+        key: cl(raw.get(key))
         for key in ("full_name", "headline", "email", "phone", "location", "linkedin", "website", "summary")
     }
 
@@ -359,8 +386,8 @@ def normalize_cv(raw: dict[str, Any]) -> dict[str, Any]:
     for e in as_list(raw.get("experience")):
         if not isinstance(e, dict):
             continue
-        item = {k: clean(e.get(k)) for k in ("title", "company", "location", "start_date", "end_date")}
-        item["bullets"] = as_bullets(e.get("bullets"))
+        item = {k: cl(e.get(k)) for k in ("title", "company", "location", "start_date", "end_date")}
+        item["bullets"] = bul(e.get("bullets"))
         if item["title"] or item["company"]:
             cv["experience"].append(item)
 
@@ -368,9 +395,9 @@ def normalize_cv(raw: dict[str, Any]) -> dict[str, Any]:
     for e in as_list(raw.get("education")):
         if not isinstance(e, dict):
             continue
-        item = {k: clean(e.get(k)) for k in ("degree", "institution", "location", "start_date", "end_date")}
+        item = {k: cl(e.get(k)) for k in ("degree", "institution", "location", "start_date", "end_date")}
         details = e.get("details")
-        item["details"] = "; ".join(as_bullets(details)) if isinstance(details, list) else clean(details)
+        item["details"] = "; ".join(bul(details)) if isinstance(details, list) else cl(details)
         if item["degree"] or item["institution"]:
             cv["education"].append(item)
 
@@ -378,18 +405,18 @@ def normalize_cv(raw: dict[str, Any]) -> dict[str, Any]:
     raw_skills = raw.get("skills")
     if isinstance(raw_skills, dict):
         for cat, items in raw_skills.items():
-            vals = [clean(i) for i in as_list(items) if clean(i)]
+            vals = [cl(i) for i in as_list(items) if cl(i)]
             if vals:
-                skills.append((clean(cat), vals))
+                skills.append((cl(cat), vals))
     else:
         loose: list[str] = []
         for s in as_list(raw_skills):
             if isinstance(s, dict):
-                vals = [clean(i) for i in as_list(s.get("items")) if clean(i)]
+                vals = [cl(i) for i in as_list(s.get("items")) if cl(i)]
                 if vals:
-                    skills.append((clean(s.get("category")) or "Skills", vals))
-            elif clean(s):
-                loose.append(clean(s))
+                    skills.append((cl(s.get("category")) or "Skills", vals))
+            elif cl(s):
+                loose.append(cl(s))
         if loose:
             skills.append(("Skills", loose))
     cv["skills"] = skills
@@ -397,33 +424,33 @@ def normalize_cv(raw: dict[str, Any]) -> dict[str, Any]:
     cv["certifications"] = []
     for c in as_list(raw.get("certifications")):
         if isinstance(c, dict):
-            item = {k: clean(c.get(k)) for k in ("name", "issuer", "date")}
+            item = {k: cl(c.get(k)) for k in ("name", "issuer", "date")}
         else:
-            item = {"name": clean(c), "issuer": "", "date": ""}
+            item = {"name": cl(c), "issuer": "", "date": ""}
         if item["name"]:
             cv["certifications"].append(item)
 
     cv["projects"] = []
     for p in as_list(raw.get("projects")):
         if isinstance(p, dict):
-            item = {k: clean(p.get(k)) for k in ("name", "technologies", "description")}
-            item["bullets"] = as_bullets(p.get("bullets"))
+            item = {k: cl(p.get(k)) for k in ("name", "technologies", "description")}
+            item["bullets"] = bul(p.get("bullets"))
         else:
-            item = {"name": clean(p), "technologies": "", "description": "", "bullets": []}
+            item = {"name": cl(p), "technologies": "", "description": "", "bullets": []}
         if item["name"]:
             cv["projects"].append(item)
 
     langs: list[str] = []
     for lang in as_list(raw.get("languages")):
         if isinstance(lang, dict):
-            name, level = clean(lang.get("language")), clean(lang.get("proficiency"))
+            name, level = cl(lang.get("language")), cl(lang.get("proficiency"))
             if name:
                 langs.append(f"{name} ({level})" if level else name)
-        elif clean(lang):
-            langs.append(clean(lang))
+        elif cl(lang):
+            langs.append(cl(lang))
     cv["languages"] = langs
 
-    cv["achievements"] = as_bullets(raw.get("achievements"))
+    cv["achievements"] = bul(raw.get("achievements"))
     return cv
 
 
@@ -724,6 +751,334 @@ def build_cv_pdf(
 
 
 # --------------------------------------------------------------------------- #
+# Word (.docx) generation (python-docx) - fully editable output
+# --------------------------------------------------------------------------- #
+
+DOCX_FONT = "Calibri"  # ships with Word; LibreOffice/Google Docs substitute a metric-compatible font
+_DARK = RGBColor(0x22, 0x22, 0x22)
+_GREY = RGBColor(0x44, 0x44, 0x44)
+
+
+def _section_order(cv: dict[str, Any]) -> list[str]:
+    """Experienced candidates lead with experience; freshers lead with education."""
+    if cv["experience"]:
+        return ["summary", "experience", "education", "skills", "certifications",
+                "projects", "languages", "achievements"]
+    return ["summary", "education", "projects", "skills", "certifications", "languages", "achievements"]
+
+
+def _docx_style_font(
+    style: Any,
+    size: float | None = None,
+    bold: bool | None = None,
+    italic: bool | None = None,
+    color: RGBColor | None = None,
+) -> None:
+    """Set a style's font, removing theme-font attributes that would override the name."""
+    style.font.name = DOCX_FONT
+    rfonts = style.element.get_or_add_rPr().find(qn("w:rFonts"))
+    if rfonts is not None:
+        for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+            rfonts.attrib.pop(qn(attr), None)
+        rfonts.set(qn("w:eastAsia"), DOCX_FONT)
+        rfonts.set(qn("w:cs"), DOCX_FONT)
+    if size is not None:
+        style.font.size = Pt(size)
+    if bold is not None:
+        style.font.bold = bold
+    if italic is not None:
+        style.font.italic = italic
+    if color is not None:
+        style.font.color.rgb = color
+
+
+def _docx_hyperlink(paragraph: Any, url: str, text: str, color_hex: str) -> None:
+    """Append a clickable hyperlink run (python-docx has no public API for this)."""
+    r_id = paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True)
+    link = OxmlElement("w:hyperlink")
+    link.set(qn("r:id"), r_id)
+    link.set(qn("w:history"), "1")
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), color_hex.lstrip("#"))
+    rpr.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    rpr.append(underline)
+    run.append(rpr)
+    node = OxmlElement("w:t")
+    node.text = text
+    node.set(qn("xml:space"), "preserve")
+    run.append(node)
+    link.append(run)
+    paragraph._p.append(link)
+
+
+def _docx_page_field(paragraph: Any, instruction: str = "PAGE") -> None:
+    field = OxmlElement("w:fldSimple")
+    field.set(qn("w:instr"), instruction)
+    run = OxmlElement("w:r")
+    node = OxmlElement("w:t")
+    node.text = "1"
+    run.append(node)
+    field.append(run)
+    paragraph._p.append(field)
+
+
+def build_cv_docx(
+    cv: dict[str, Any],
+    photo_bytes: bytes | None = None,
+    accent_hex: str = "#1F3A5F",
+    pagesize: tuple[float, float] = A4,
+) -> bytes:
+    """Render the normalised CV dict to an editable Word document and return the bytes."""
+    accent = RGBColor.from_string(accent_hex.lstrip("#").upper())
+    doc = Document()
+    zoom = doc.settings.element.find(qn("w:zoom"))  # python-docx's template omits the required percent
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+
+    # ---- Page setup ----
+    section = doc.sections[0]
+    section.page_width, section.page_height = Pt(pagesize[0]), Pt(pagesize[1])
+    section.left_margin = section.right_margin = Cm(1.8)
+    section.top_margin, section.bottom_margin = Cm(1.5), Cm(1.6)
+    section.footer_distance = Cm(0.8)
+    text_width = section.page_width - section.left_margin - section.right_margin
+
+    # ---- Styles (real Word styles so the user can restyle the whole CV in one click) ----
+    styles = doc.styles
+    normal = styles["Normal"]
+    _docx_style_font(normal, 10, color=_DARK)
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(0)
+    normal.paragraph_format.line_spacing = 1.08
+
+    def custom(name: str, size: float, **kw: Any) -> Any:
+        style = styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        style.base_style = normal
+        _docx_style_font(style, size, **kw)
+        return style
+
+    custom("CV Name", 23, bold=True, color=accent).paragraph_format.space_after = Pt(1)
+    custom("CV Headline", 11.5, color=_GREY).paragraph_format.space_after = Pt(3)
+    custom("CV Contact", 9)
+    custom("CV Entry", 10)
+    custom("CV Sub", 9.5, italic=True, color=_GREY)
+
+    heading = styles["Heading 1"]  # built-in, so it shows in Word's Navigation Pane
+    _docx_style_font(heading, 10.5, bold=True, color=accent)
+    heading.paragraph_format.space_before = Pt(9)
+    heading.paragraph_format.space_after = Pt(4)
+    heading.paragraph_format.keep_with_next = True
+    ppr = heading.element.get_or_add_pPr()
+    border = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    for key, val in (("w:val", "single"), ("w:sz", "8"), ("w:space", "1"), ("w:color", accent_hex.lstrip("#"))):
+        bottom.set(qn(key), val)
+    border.append(bottom)
+    ppr.insert_element_before(
+        border, "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap", "w:overflowPunct",
+        "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid",
+        "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap", "w:jc",
+        "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId",
+        "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+    )
+
+    # ---- Small helpers ----
+    def new_par(container: Any, style: str, first: bool = False) -> Any:
+        if first and container.paragraphs and not container.paragraphs[0].text:
+            par = container.paragraphs[0]
+            par.style = styles[style]
+            return par
+        return container.add_paragraph(style=style)
+
+    def entry_line(left: str, right: str = "", suffix: str = "") -> Any:
+        """Bold title on the left, optional plain suffix, dates pushed to the right margin."""
+        par = doc.add_paragraph(style="CV Entry")
+        par.paragraph_format.keep_with_next = True
+        par.paragraph_format.tab_stops.add_tab_stop(text_width, WD_TAB_ALIGNMENT.RIGHT)
+        par.add_run(left).bold = True
+        if suffix:
+            par.add_run(suffix)
+        if right:
+            date_run = par.add_run("\t" + right)
+            date_run.font.color.rgb = _GREY
+        return par
+
+    def sub_line(text: str) -> Any:
+        par = doc.add_paragraph(text, style="CV Sub")
+        par.paragraph_format.keep_with_next = True
+        return par
+
+    def bullets(items: list[str]) -> Any:
+        last = None
+        for item in items:
+            par = doc.add_paragraph(item, style="List Bullet")
+            fmt = par.paragraph_format
+            fmt.left_indent, fmt.first_line_indent, fmt.space_after = Cm(0.6), Cm(-0.4), Pt(1.5)
+            last = par
+        return last
+
+    def end_entry(par: Any, gap: float = 5) -> None:
+        if par is not None:
+            par.paragraph_format.space_after = Pt(gap)
+
+    def add_heading(title: str) -> None:
+        doc.add_paragraph(title.upper(), style="Heading 1")
+
+    # ---- Header: name, headline, contact, optional photo ----
+    if photo_bytes:
+        table = doc.add_table(rows=1, cols=2)
+        table.autofit = False
+        photo_w = Cm(3.0)
+        widths = (text_width - photo_w - Cm(0.4), photo_w + Cm(0.4))
+        tbl_pr = table._tbl.tblPr
+        margins = OxmlElement("w:tblCellMar")
+        for side in ("top", "left", "bottom", "right"):
+            node = OxmlElement(f"w:{side}")
+            node.set(qn("w:w"), "0")
+            node.set(qn("w:type"), "dxa")
+            margins.append(node)
+        tbl_pr.insert_element_before(margins, "w:tblLook", "w:tblCaption", "w:tblDescription", "w:tblPrChange")
+        for cell, width in zip(table.rows[0].cells, widths):
+            cell.width = width
+        head_cell, photo_cell = table.rows[0].cells
+        photo_par = photo_cell.paragraphs[0]
+        photo_par.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        photo_par.add_run().add_picture(io.BytesIO(photo_bytes), width=photo_w, height=photo_w)
+    else:
+        head_cell = doc
+
+    new_par(head_cell, "CV Name", first=True).add_run(cv["full_name"] or "Your Name")
+    if cv["headline"]:
+        head_cell.add_paragraph(cv["headline"], style="CV Headline")
+
+    line1 = [(t, None) for t in (cv["location"], cv["phone"]) if t]
+    if cv["email"]:
+        line1.append((cv["email"], "mailto:" + cv["email"].replace(" ", "")))
+    line2 = []
+    for key in ("linkedin", "website"):
+        if cv[key]:
+            label = re.sub(r"^https?://(www\.)?", "", cv[key].strip(), flags=re.IGNORECASE).rstrip("/")
+            line2.append((label, _url(cv[key])))
+    for line in (line1, line2):
+        if not line:
+            continue
+        par = head_cell.add_paragraph(style="CV Contact")
+        for i, (text, url) in enumerate(line):
+            if i:
+                par.add_run("  |  ")
+            if url:
+                _docx_hyperlink(par, url, text, accent_hex)
+            else:
+                par.add_run(text)
+
+    # ---- Sections ----
+    def summary_section() -> None:
+        if cv["summary"]:
+            add_heading("Professional Summary")
+            doc.add_paragraph(cv["summary"])
+
+    def experience_section() -> None:
+        if not cv["experience"]:
+            return
+        add_heading("Professional Experience")
+        for e in cv["experience"]:
+            last = entry_line(e["title"] or e["company"], _date_range(e["start_date"], e["end_date"]))
+            sub = _join(e["company"] if e["title"] else "", e["location"])
+            if sub:
+                last = sub_line(sub)
+            last = bullets(e["bullets"]) or last
+            last.paragraph_format.keep_with_next = False
+            end_entry(last)
+
+    def education_section() -> None:
+        if not cv["education"]:
+            return
+        add_heading("Education")
+        for e in cv["education"]:
+            last = entry_line(e["degree"] or e["institution"], _date_range(e["start_date"], e["end_date"]))
+            sub = _join(e["institution"] if e["degree"] else "", e["location"])
+            if sub:
+                last = sub_line(sub)
+            if e["details"]:
+                last.paragraph_format.keep_with_next = True
+                last = doc.add_paragraph(e["details"])
+            last.paragraph_format.keep_with_next = False
+            end_entry(last, 4)
+
+    def skills_section() -> None:
+        if not cv["skills"]:
+            return
+        add_heading("Skills")
+        for category, items in cv["skills"]:
+            par = doc.add_paragraph()
+            par.add_run(category + ": ").bold = True
+            par.add_run(", ".join(items))
+            par.paragraph_format.space_after = Pt(2)
+
+    def certifications_section() -> None:
+        if not cv["certifications"]:
+            return
+        add_heading("Certifications")
+        for c in cv["certifications"]:
+            par = entry_line(c["name"], c["date"], suffix=(" \u2013 " + c["issuer"]) if c["issuer"] else "")
+            par.paragraph_format.keep_with_next = False
+            par.paragraph_format.space_after = Pt(2)
+
+    def projects_section() -> None:
+        if not cv["projects"]:
+            return
+        add_heading("Projects")
+        for p in cv["projects"]:
+            last = entry_line(p["name"])
+            if p["technologies"]:
+                last = sub_line("Technologies: " + p["technologies"])
+            if p["description"]:
+                last.paragraph_format.keep_with_next = True
+                last = doc.add_paragraph(p["description"])
+            last = bullets(p["bullets"]) or last
+            last.paragraph_format.keep_with_next = False
+            end_entry(last, 4)
+
+    def languages_section() -> None:
+        if cv["languages"]:
+            add_heading("Languages")
+            doc.add_paragraph(", ".join(cv["languages"]))
+
+    def achievements_section() -> None:
+        if cv["achievements"]:
+            add_heading("Achievements & Activities")
+            bullets(cv["achievements"])
+
+    builders = {
+        "summary": summary_section, "experience": experience_section, "education": education_section,
+        "skills": skills_section, "certifications": certifications_section, "projects": projects_section,
+        "languages": languages_section, "achievements": achievements_section,
+    }
+    for name in _section_order(cv):
+        builders[name]()
+
+    # ---- Footer: "Name | Page N" on pages 2+ (like the PDF) ----
+    section.different_first_page_header_footer = True
+    footer_par = section.footer.paragraphs[0]
+    footer_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer_run = footer_par.add_run(f"{cv['full_name']}  |  Page ")
+    footer_run.font.size = Pt(8)
+    footer_run.font.color.rgb = RGBColor(0x77, 0x77, 0x77)
+    _docx_page_field(footer_par)
+
+    doc.core_properties.title = f"{cv['full_name']} - CV" if cv["full_name"] else "CV"
+    doc.core_properties.author = cv["full_name"] or ""
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+# --------------------------------------------------------------------------- #
 # Streamlit UI
 # --------------------------------------------------------------------------- #
 
@@ -743,6 +1098,8 @@ def init_state() -> None:
         "interview_done": False,
         "cv_data": None,
         "pdf_bytes": None,
+        "docx_bytes": None,
+        "pdf_lossy": False,   # True when the PDF had to drop characters the Word file keeps
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -868,7 +1225,7 @@ def main() -> None:
             st.session_state.messages = [
                 {"role": "user", "content": "Hi! I'd like to create a professional CV.", "hidden": True}
             ]
-            st.session_state.update(started=True, interview_done=False, cv_data=None, pdf_bytes=None)
+            st.session_state.update(started=True, interview_done=False, cv_data=None, pdf_bytes=None, docx_bytes=None)
             try:
                 with st.spinner("Starting the interview..."):
                     ask_agent(get_client(api_key, base_url), model)
@@ -881,6 +1238,7 @@ def main() -> None:
         if user_input and api_key:
             st.session_state.messages.append({"role": "user", "content": user_input})
             st.session_state.pdf_bytes = None  # CV is now out of date
+            st.session_state.docx_bytes = None
             try:
                 with st.spinner("Thinking..."):
                     ask_agent(get_client(api_key, base_url), model)
@@ -912,13 +1270,19 @@ def main() -> None:
     if st.button("✨ Generate CV", disabled=not ready, type="primary", key="gen_btn"):
         try:
             with st.spinner("Writing and formatting your CV..."):
-                cv = extract_cv_data(get_client(api_key, base_url), model, st.session_state.messages)
-                if not cv["full_name"]:
+                raw = extract_cv_data(get_client(api_key, base_url), model, st.session_state.messages)
+                cv_word = normalize_cv(raw, latin_only=False)  # keeps every script (e.g. Urdu)
+                cv_pdf = normalize_cv(raw, latin_only=True)    # limited to the PDF font's range
+                if not cv_word["full_name"]:
                     raise ValueError("I could not find your name yet. Please provide it in the chat and try again.")
-                st.session_state.cv_data = cv
-                st.session_state.pdf_bytes = build_cv_pdf(
-                    cv, photo_bytes, ACCENT_COLORS[accent_name], PAGE_SIZES[page_name]
-                )
+                accent_hex, pagesize = ACCENT_COLORS[accent_name], PAGE_SIZES[page_name]
+                st.session_state.cv_data = cv_word
+                st.session_state.pdf_lossy = json.dumps(cv_pdf) != json.dumps(cv_word)
+                st.session_state.pdf_bytes = build_cv_pdf(cv_pdf, photo_bytes, accent_hex, pagesize)
+                try:
+                    st.session_state.docx_bytes = build_cv_docx(cv_word, photo_bytes, accent_hex, pagesize)
+                except Exception:
+                    st.session_state.docx_bytes = None  # never lose the PDF because Word export failed
         except ValueError as exc:
             st.error(str(exc))
         except Exception as exc:
@@ -926,15 +1290,33 @@ def main() -> None:
 
     if st.session_state.pdf_bytes:
         cv = st.session_state.cv_data
-        st.success("Your CV is ready!")
-        file_name = (re.sub(r"[^A-Za-z0-9]+", "_", cv["full_name"]).strip("_") or "CV") + "_CV.pdf"
-        st.download_button(
-            "⬇️ Download CV (PDF)",
-            data=st.session_state.pdf_bytes,
-            file_name=file_name,
-            mime="application/pdf",
-            key="download_btn",
-        )
+        st.success("Your CV is ready! Download it as a PDF, or as a Word file you can edit.")
+        base_name = re.sub(r"[^A-Za-z0-9]+", "_", cv["full_name"]).strip("_") or "CV"
+        pdf_col, word_col = st.columns(2)
+        with pdf_col:
+            st.download_button(
+                "⬇️ Download PDF",
+                data=st.session_state.pdf_bytes,
+                file_name=f"{base_name}_CV.pdf",
+                mime="application/pdf",
+                key="download_btn",
+            )
+        with word_col:
+            if st.session_state.docx_bytes:
+                st.download_button(
+                    "📝 Download Word (editable)",
+                    data=st.session_state.docx_bytes,
+                    file_name=f"{base_name}_CV.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key="download_docx_btn",
+                )
+            else:
+                st.warning("The Word version could not be created this time. The PDF is ready.")
+        if st.session_state.pdf_lossy:
+            st.info(
+                "Some characters (for example Urdu/Arabic/Chinese text) cannot be drawn by the PDF's built-in "
+                "font, so the PDF leaves them out. The Word file keeps them."
+            )
         with st.expander("Review the data used in your CV"):
             st.json(cv)
         st.caption("Missing or wrong something? Keep chatting above, then click **Generate CV** again.")
