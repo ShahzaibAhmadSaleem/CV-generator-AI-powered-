@@ -1,9 +1,9 @@
 
 # 📄 AI CV Generator
 
-An AI-powered CV (resume) builder. You chat with an AI interviewer powered by **Groq** (default) or **xAI Grok**, answer a few simple questions, and download a clean, professionally formatted, ATS-friendly **PDF CV** that is ready to send to employers.
+An AI-powered CV (resume) builder. You chat with an AI interviewer powered by **Groq** (default) or **xAI Grok**, answer a few simple questions, and download a clean, professionally formatted, ATS-friendly CV as a **PDF** (ready to send) or as an **editable Word (.docx) file** (to tweak further).
 
-Built with **Streamlit** (UI), the **Groq or xAI API** (conversation + content writing) and **ReportLab** (PDF generation).
+Built with **Streamlit** (UI), the **Groq or xAI API** (conversation + content writing), **ReportLab** (PDF generation) and **python-docx** (Word generation).
 
 > **Groq vs Grok:** these are two different companies. **Groq** (groq.com) hosts open models such as Llama; its keys start with `gsk_`. **Grok** is xAI's model; its keys start with `xai-`. The app supports both, picks the correct endpoint automatically, and detects which one you have from the key prefix.
 
@@ -15,7 +15,8 @@ Built with **Streamlit** (UI), the **Groq or xAI API** (conversation + content w
 - **Two AI providers**: Groq (default, `llama-3.3-70b-versatile`) or xAI Grok. The model list is loaded live from your account, so you only see models your key can use.
 - **Guided AI interview** (the *Start conversation* button). The agent asks for everything a good CV needs, a few questions at a time:
   full name, email, phone, location, LinkedIn/website, target role, work experience (with achievements), education, skills, certifications, projects, languages and awards.
-- **One-click CV generation.** The AI turns your answers into structured, polished CV content (action-verb bullets, consistent dates, a professional summary) and a PDF is produced instantly.
+- **Two download formats from one click**: a print-ready **PDF** and a fully **editable Word file** with the same design. The Word file uses real Word styles (Heading 1 for sections, built-in bullet lists, right-aligned date tab stops, clickable links), so you can edit text, add sections, or restyle the whole CV from Word's Styles pane. It also opens in Google Docs, LibreOffice and Pages.
+- **One-click CV generation.** The AI turns your answers into structured, polished CV content (action-verb bullets, consistent dates, a professional summary) and both a PDF and a Word file are produced instantly.
 - **Formal, job-ready layout**: single column, standard section headings, real selectable text (so Applicant Tracking Systems can read it), clickable email/LinkedIn links, automatic multi-page handling with page numbers.
 - **Customisable style**: 4 accent colours and A4 / US Letter page size.
 - **Honest by design**: the AI is instructed never to invent employers, dates, numbers or skills. If you did not provide something, it is simply left out.
@@ -35,12 +36,13 @@ Built with **Streamlit** (UI), the **Groq or xAI API** (conversation + content w
  Generate CV ──► the AI converts the transcript into structured JSON
         │
         ▼
- Python validates and cleans the data ──► ReportLab renders the PDF ──► Download
+ Python validates and cleans the data ──┬─► ReportLab renders the PDF ──┐
+                                         └─► python-docx builds the .docx ┴─► Download
 ```
 
 1. **Interview** – A system prompt turns the model into a friendly career coach that asks 2–3 related questions at a time and signals when it has everything.
 2. **Extraction** – When you click *Generate CV*, the full transcript is sent to the model with a strict JSON schema. The response is parsed defensively (handles code fences, stray text, wrong types).
-3. **Rendering** – The cleaned data is laid out with ReportLab (Platypus) into a one- or two-page PDF.
+3. **Rendering** – The cleaned data is laid out with ReportLab (Platypus) into a one- or two-page PDF, and with python-docx into an editable Word document using the same sections, order and colours.
 
 Both providers are OpenAI-compatible, so the app uses the official `openai` Python SDK pointed at `https://api.groq.com/openai/v1` (Groq) or `https://api.x.ai/v1` (xAI).
 
@@ -50,7 +52,7 @@ Both providers are OpenAI-compatible, so the app uses the official `openai` Pyth
 
 ```
 ai-cv-generator/
-├── app.py            # Streamlit app: UI, LLM calls (Groq or xAI), data cleaning, PDF builder
+├── app.py            # Streamlit app: UI, LLM calls (Groq or xAI), data cleaning, PDF + Word builders
 ├── requirements.txt  # Python dependencies
 └── README.md         # This file
 ```
@@ -140,7 +142,9 @@ All of this lives in `app.py`:
 - **Interview questions / tone** → edit `INTERVIEW_SYSTEM_PROMPT`.
 - **What the AI extracts and how it words bullets** → edit `EXTRACTION_SYSTEM_PROMPT`.
 - **Colours** → `ACCENT_COLORS`. **Page sizes** → `PAGE_SIZES`.
-- **Layout, fonts, spacing, section order** → `_styles()` and `build_cv_pdf()`.
+- **PDF layout, fonts, spacing** → `_styles()` and `build_cv_pdf()`.
+- **Word layout, fonts, spacing** → the style block in `build_cv_docx()` (font is `DOCX_FONT`, default Calibri).
+- **Section order** → `build_cv_pdf()` and `_section_order()` (Word).
 - **Providers / default models** → `PROVIDERS`.
 
 ---
@@ -155,13 +159,15 @@ All of this lives in `app.py`:
 | "Rate limit or quota reached" | Wait a minute (Groq's free tier has per-minute limits) or check your usage limits, then retry. |
 | "I could not find your name yet" | Tell the interviewer your full name in the chat, then click *Generate CV* again. |
 | Photo is rejected | Use a valid PNG or JPG file. |
-| Some characters are missing in the PDF | See *Limitations* below. |
+| Some characters are missing in the PDF | The PDF's built-in fonts only cover Latin letters. The Word file keeps all scripts; see *Limitations*. |
+| The Word button is missing | The PDF is still created; Word export failed this time. Click *Generate CV* again and, if it persists, open an issue with the error. |
+| Word shows a different font | Calibri ships with Microsoft Word. Other apps substitute a similar font; change `DOCX_FONT` to e.g. `Arial` if you prefer. |
 
 ---
 
 ## ⚠️ Limitations
 
-- **Latin-script text only in the PDF.** The built-in PDF fonts cannot draw Arabic/Urdu/Pashto, Chinese, Cyrillic, etc. Accented Latin letters (é, ü, ñ …) are fine; unsupported characters are transliterated or dropped instead of showing as black boxes. To support more scripts, register a Unicode TTF font (e.g. Noto Sans) with ReportLab's `pdfmetrics.registerFont` and use it in `_styles()`.
+- **PDF is Latin-script only; Word is not.** The built-in PDF fonts cannot draw Arabic/Urdu/Pashto, Chinese, Cyrillic, etc. Accented Latin letters (é, ü, ñ …) are fine; unsupported characters are transliterated or dropped from the PDF instead of showing as black boxes, and the app tells you when that happens. The **Word file keeps every script** (layout stays left-to-right, so right-to-left text may need alignment adjusted in Word). If your name is entirely non-Latin, use the Word file. To support more scripts in the PDF, register a Unicode TTF font (e.g. Noto Sans) with ReportLab's `pdfmetrics.registerFont` and use it in `_styles()`.
 - **AI can make mistakes.** Always read the generated CV before sending it. Use the *Review the data* panel to check what was extracted.
 - **No persistence.** Conversations and CVs live only in the browser session and are not saved by the app.
 - **Privacy.** Your answers are sent to the selected AI provider (Groq or xAI) to generate the CV. Do not share anything you are not comfortable sending to a third-party AI provider.
@@ -170,7 +176,7 @@ All of this lives in `app.py`:
 
 ## 💡 Ideas for future improvements
 
-Multiple CV templates, cover-letter generation, tailoring the CV to a pasted job description, editable CV preview before export, DOCX export, Unicode font support, and multi-language CVs.
+Multiple CV templates, cover-letter generation, tailoring the CV to a pasted job description, an editable in-app preview before export, Unicode fonts in the PDF, and right-to-left CV layouts.
 
 ---
 
